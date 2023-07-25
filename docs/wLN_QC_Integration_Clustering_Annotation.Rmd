@@ -1,0 +1,1045 @@
+---
+title: "wLN_QC_Integration_Clustering_Annotation"
+output: html_notebook
+---
+
+```{r libraries}
+library(DropletUtils) 
+library(SingleCellExperiment)
+library(scater)
+library(scuttle)
+library(GenomicRanges)
+library(tidyr)
+library(scran)
+library(dittoSeq)
+library(uwot)
+library(zellkonverter)
+library(reticulate)
+library(SingleCellExperiment)
+library(qs)
+library(dplyr)
+library(optparse)
+library(bluster)
+library(SingleR) 
+library(celldex)
+library(MuData)
+library(MultiAssayExperiment)
+library(HDF5Array)
+library(harmony)
+library(biomaRt)
+library(DESeq2)
+library(anndata)
+library(zellkonverter)
+library(basilisk)
+```
+
+```{r}
+#loading in the data
+sce <- qread("/Users/nityagupta/Downloads/005_pr_whole_unfilt_sce_rna.qs")
+
+```
+
+```{r}
+#making sure the headers don't get dropped
+colData(sce)$index <- rownames(colData(sce))
+```
+
+```{r}
+#adding in the metadata
+
+metadata <- read.table(file='/Users/nityagupta/Downloads/005_pr_whole_cell_metadata.tsv', header = TRUE)
+
+colData(sce)$gender <- "female"
+colData(sce)$sorting_strategy <- "Column_Depletion"
+colData(sce)$primate_DOB <- ifelse(colData(sce)$sample_id == "PrLN1_wCTRL", "26/06/2016", ifelse(colData(sce)$sample_id == "PrLN2_wCTRL", "14/02/2011",ifelse(colData(sce)$sample_id == "PrLN4_wCTRL", "13/12/2011", ifelse(colData(sce)$sample_id == "PrLN5_wCTRL", "18/03/2011", ifelse(colData(sce)$sample_id == "PrLN6_wCTRL", "08/04/2008","NA")))))
+summary(as.factor(colData(sce)$sample_id))
+table(colData(sce)$primate_DOB, colData(sce)$sample_id)
+
+colData(sce)$date_of_processing <- ifelse(colData(sce)$sample_id == "PrLN1_wCTRL", "09/12/2021", ifelse(colData(sce)$sample_id == "PrLN2_wCTRL", "09/12/2021", "13/07/2022"))
+table(colData(sce)$date_of_processing, colData(sce)$sample_id)
+
+colData(sce)$tissue_used <- ifelse(colData(sce)$sample_id == "PrLN6_wCTRL", "Axillary Node 1 (Half)", "Axillary Node 1")
+table(colData(sce)$tissue_used, colData(sce)$sample_id)
+
+colData(sce)$spike_in <- ifelse(colData(sce)$sample_id == "PrLN5_wCTRL", "No spike back", ifelse(colData(sce)$sample_id == "PrLN6_wCTRL", "500 column retained T&B cells per 20,000 cells","500 column retained T&B cells per 20,000 cells"))
+table(colData(sce)$spike_in, colData(sce)$sample_id)
+
+colData(sce)$notes_on_strategy <- ifelse(colData(sce)$sample_id == "PrLN1_wCTRL", "Poor depletion indicated by flow, but decided to run for sequencing anyway", ifelse(colData(sce)$sample_id == "PrLN2_wCTRL", "Better depletion indicated by flow, despite higher numbers post depletion",ifelse(colData(sce)$sample_id == "PrLN5_wCTRL", "More cells post depletion indicates less successful depletion so no spike back", "-")))
+table(colData(sce)$notes_on_strategy, colData(sce)$sample_id)
+
+colData(sce)$notes_on_primate <- ifelse(colData(sce)$sample_id == "PrLN4_wCTRL", "Longterm contraceptive implant", ifelse(colData(sce)$sample_id == "PrLN5_wCTRL", "Very small lymph nodes",ifelse(colData(sce)$sample_id == "PrLN6_wCTRL", "Longterm contraceptive implant", "-")))
+table(colData(sce)$notes_on_primate, colData(sce)$sample_id)
+```
+
+```{r}
+#How many genes/features are present?
+nrow(sce)
+#21761
+
+#How many cells?
+ncol(sce)
+#51290
+```
+
+
+### Quality Control
+
+```{r}
+#finding all mitochrondrial genes in the Macaca mulatta species annotates in ensemble
+
+ensembl <- useEnsembl(biomart = "genes")
+
+#to find the species
+datasets <- listDatasets(ensembl)
+
+ensembl <- useDataset(dataset = "mmulatta_gene_ensembl")
+
+# to select the input and output infomation
+filters <- listFilters(ensembl)
+attributes <- listAttributes(ensembl)
+
+MTgenes <- getBM(attributes = c("external_gene_name", "ensembl_gene_id", "chromosome_name", "gene_biotype", "uniprot_gn_id"), filters = c("chromosome_name", "biotype"), values = list(chromosome_name = "MT", biotype = "protein_coding"),  mart = useMart("ensembl", "mmulatta_gene_ensembl"))
+mt_genes <- MTgenes %>% pull(external_gene_name)
+mt_genes
+
+
+#same genes used in two papers:
+#genes used in paper: Analysis of single-cell RNA-Seq data of Macaca fascicularis spematogenesis
+#genes used in paper: Cell transcriptomic atlas of the non-human primate Macaca fascicularis
+```
+
+
+
+```{r}
+#computing the quality control metrics
+stats <- perCellQCMetrics(sce, subsets=list(mito=mt_genes))
+stats <- data.frame(stats)
+
+# Plot the UMIcount / library size (total number of RNA molecules) on the x-axis and the number of unique gene features on the y-axis as scatter plot.
+ggplot(stats, aes(x = sum, y = detected)) +
+  geom_point()
+
+ggplot(stats, aes(x = sum, y = detected)) +
+  geom_point() +
+  scale_y_continuous(trans='log10')
+
+# Plot library size on the x-axis, percentage of MT genes on the y-axis as scatter plot
+ggplot(stats, aes(x = sum, y = subsets_mito_percent)) +
+  geom_point()
+
+```
+
+```{r}
+# setting the thresholds
+# cells with low numbers of detected features and high mitochondrial percentages are filtered out
+
+#for cell/feature counts
+ggplot(stats, aes(x = sum, y = detected)) +
+  geom_point() +
+  geom_vline(xintercept = 75000, color = "darkred") + #sum
+  geom_hline(yintercept = 500 , color = "darkred") + #detected
+  labs(x = "UMI count", y = "Gene count") +
+  geom_text(aes(50000, 650, label = "500"), show.legend = FALSE, color = "darkred")+
+  geom_text(aes(80000, 3000, label = "75000"), show.legend = FALSE, color = "darkred")
+
+qc.lib <- stats$sum > 75000
+qc.nexprs <- stats$detected < 500
+
+#for percentage MT
+# A threshold of 25 was set originally, this was adjusted to 20 as cells with high mitochondrial percentages were interfering with clustering
+
+ggplot(stats, aes(x = sum, y = subsets_mito_percent)) +
+  geom_point() +
+  geom_hline(yintercept = 20, color = "darkred") +
+  labs(x= "UMI count", y = "Mitochondrial RNA percent") +
+  geom_text(aes(75000, 23, label = "20%"), show.legend = FALSE, color = "darkred")
+
+qc.mito <- stats$subsets_mito_percent > 20
+
+discard <- qc.lib | qc.nexprs | qc.mito
+
+
+DataFrame(low_lib_size=sum(qc.lib), low_n_features=sum(qc.nexprs), high_subsets_mito_percent=sum(qc.mito), total_discard=sum(discard))
+
+```
+
+```{r}
+# adding quality control metrics to the sce object
+sce <- addPerCellQC(sce, subsets=list(mito=mt_genes))
+sce$discard <- discard
+summary(sce$discard)
+table(sce$discard, sce$donor_id)
+
+```
+
+```{r}
+#making plots of cells to be discarded
+plotColData(sce, x="sum", y="subsets_mito_percent", colour_by="discard") + labs(x= "UMI count", y = "Mitochondrial RNA percent", fill = "Discard")
+
+plotColData(sce, x="sum", y="detected", colour_by="discard") +
+  labs(x = "UMI count", y = "Gene count") 
+```
+
+```{r}
+#Discared the unwanted cells
+sce <- sce[,discard == FALSE]
+
+#How many cells are now in the filtered sce object?
+nrow(colData(sce))
+
+## 48556
+```
+
+```{r}
+# Removing predicted doublets
+# In the first attempt at clustering the predicted doublets were included. They were visualized using the function 'plotReducedDim(sce, dimred = "UMAP", colour_by = "predicted_doublets"). Processing was repeated and the predicted doublets were excluded at this stage from further analysis
+
+
+summary(as.factor(sce$predicted_doublets))
+
+sce <- subset(sce, ,predicted_doublets == FALSE)
+
+```
+
+
+### Normalisation
+
+```{r}
+# Calculate the library size factor using the function librarySizeFactors()
+lib.sf.sce <- librarySizeFactors(sce)
+summary(lib.sf.sce)
+
+# Graph the distribution of size factors derived from the library size as a histogram.
+hist(log10(lib.sf.sce), xlab="Log10[Size factor]", col='grey80', main = " ")
+
+# normalising - Computing the log-transformed normalized expression values from the count matrix
+
+sce <- logNormCounts(sce)
+```
+
+
+## Dimensionality Reduction
+
+### Feature selection
+Selecting the most variable genes to be used for dimensionality reduction to remove potential random noise and conserve biological cariation. 
+
+```{r}
+allfeatures <- modelGeneVar(sce)
+
+# Visualizing the fit:
+fit.dat <- metadata(allfeatures)
+
+plot(fit.dat$mean, fit.dat$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit.dat$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+
+# Look at the top most variable genes in allfeatures
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+
+# Choose the top highly variable genes using getTopHVGs()
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+```
+
+
+### PCA + UMAP
+
+```{r}
+# Run PCA
+sce <- runPCA(sce, subset_row=topn2000_features)
+
+percent.var <- attr(sce@int_colData@listData[["reducedDims"]]@listData[["PCA"]], "percentVar")
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+```
+
+
+```{r}
+sce <- runUMAP(sce, dimred="PCA", min_dist = 0.5)
+set.seed(100)
+plotReducedDim(sce, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(colour = "Donor ID") + theme(legend.text = element_text(size = 11))
+
+plotReducedDim(sce, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + theme(legend.position = "none") 
+```
+
+
+## Integratioin across samples
+
+```{r}
+# Harmony returns corrected PCA embeddings after accounting for confounding variation between donors
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = sce@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(sce), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+
+sce@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+```
+
+
+```{r}
+sce <- runUMAP(sce, dimred="harmonized_pcs", min_dist = 0.5)
+set.seed(100)
+plotReducedDim(sce, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(colour = "Donor ID") + theme(legend.text = element_text(size = 11))
+
+plotReducedDim(sce, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + theme(legend.position = "none")
+```
+
+
+## Clustering + Annotation
+
+```{r}
+clust.leiden001 <- clusterCells(sce, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.001)))
+table(clust.leiden001)
+
+sce$leiden_clusters_res001 <- clust.leiden001
+```
+
+```{r}
+dittoDimPlot(sce, "leiden_clusters_res001", do.label = TRUE)
+```
+
+```{r}
+plotReducedDim(sce, dimred = "UMAP", colour_by = "subsets_mito_percent")
+```
+
+```{r}
+dittoBarPlot(sce, "leiden_clusters_res001", group.by = "donor_id")
+dittoBarPlot(sce, "donor_id", group.by = "leiden_clusters_res001")
+```
+
+
+```{r}
+
+genes <- rownames(sce)
+
+markers <- findMarkers(sce, sce$leiden_clusters_res001, pval.type="some", direction="up")
+
+key_genes <- c("ITM2A", "TRAC", "PLAC8", "CD8A", "STMN1", "HMGB2", "LYZ", "CD68", "CST3", "CD14", "FCGR3", "CD163", "GCA", "GZMK", "NKG7", "KLRB1", "GZMB", "BANK1", "RGS13", "SYNE2", "CCL17", "UBD", "FLT3", "BATF3", "CD38", "IGKC", "IRF8", "TFRC", "CD3D", "CD4", "CD3E", "CD19", "MS4A1", "NKG2D", "SDC1", "EPCAM", "PECAM1", "PTPRC", "PDPN", "THY1", "MPO")
+
+genes <- rownames(rowData(sce))
+key_genes %in% genes
+
+duplicated(key_genes)
+
+dittoDotPlot(sce, vars = key_genes, group.by = "leiden_clusters_res001")
+
+#stromal genes
+key_markers = c('PECAM1', 'PDPN', "CCL21", "CCL19", "IL7", "GREM1", "CXCL9", "CXCL12", "CD34", "CR2", "CXCL13", "BAFF", "VCAM1", "MADCAM1", "TNFSF11", "ITGA7", "ACTA2", "LYVE1", "NT5E", "CAV1", "MARCO", "CD209", "CLEC4G", "CLEC4M", "PTX3", "FOXC2", "ESAM", "CLDN11", "TNFRSF9", "CCL20", "EFNB2", "ACKR4" )
+genes <- unique(rownames(sce))
+key_markers1 <- key_markers[key_markers %in% genes]
+
+dittoDotPlot(sce, vars = key_markers1, group.by = "leiden_clusters_res001")
+
+```
+
+Broad cluster labels:
+1. T cells
+2. B cells
+3. pDCs
+4. Plasma cells
+5. Stromal fibroblasts
+6. myeloid
+7. Neutrophils
+8. mast cells
+9. Stromal endothelial cells
+10. myeloid
+
+
+
+### Subclustering the Fibroblasts
+
+```{r}
+fibroblasts <- sce[, sce$leiden_clusters_res001 == 5]
+summary(as.factor(fibroblasts$leiden_clusters_res001))
+
+#feature selection
+allfeatures <- modelGeneVar(fibroblasts)
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+
+# Run PCA
+fibroblasts <- runPCA(fibroblasts, subset_row=topn2000_features)
+
+# batch correction
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = fibroblasts@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(fibroblasts), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+fibroblasts@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+#plot UMAP
+set.seed(100) #any random number works, we just set a seed to keep it consistent in the module
+fibroblasts <- runUMAP(fibroblasts, dimred="harmonized_pcs", min_dist = 0.5, n_neighbors = 6)
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id", text_size = 10,) + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+#clustering
+clust.leiden01 <- clusterCells(fibroblasts, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.023)))
+table(clust.leiden01)
+fibroblasts$leiden023 <- clust.leiden01
+dittoDimPlot(fibroblasts, "leiden023", do.label = TRUE)
+```
+
+Plotting known fibroblast markers 
+```{r}
+key_markers = c('PECAM1', 'PDPN', "PTPRG", "CCL21", "CCL19", "IL7", "GREM1", "CXCL9", "CXCL12", "CD34", "PI16", "CR2", "CXCL13", "TNFSF13B", "VCAM1", "MADCAM1", "TNFSF11", "ITGA7", "ACTA2", "CX3CL1", "IL6", "TNFSF13", "CR1", "INMT", "OSMR", "C6")
+key_markers1 <- key_markers[key_markers %in% genes]
+dittoDotPlot(fibroblasts, vars = key_markers1, group.by = "leiden023")
+```
+
+```{r}
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="subsets_mito_percent")
+```
+
+Plotting chosen markers on the UMAP
+```{r}
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="PI16")
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="CXCL12")
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="CCL19")
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="PTPRG")
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="ACTA2")
+plotReducedDim(fibroblasts, dimred="UMAP", colour_by="RGS5")
+```
+
+
+Naming the clusters
+
+```{r}
+colData(fibroblasts)$subcluster_name <- ifelse(colData(fibroblasts)$leiden023 == 1, "PI16+_Fibroblasts", ifelse(colData(fibroblasts)$leiden023 == 2, "PTPRGhigh_Fibroblasts", ifelse(colData(fibroblasts)$leiden023 == 3, "Pericytes", ifelse(colData(fibroblasts)$leiden023 == 5, "Myofibroblasts", ifelse(colData(fibroblasts)$leiden023 == 4, "CXCL12high_Fibroblasts", "CCL19high_Fibroblasts")))))
+summary(as.factor(fibroblasts$subcluster_name))
+table(fibroblasts$subcluster_name, fibroblasts$leiden023)
+```
+
+```{r}
+dittoDimPlot(fibroblasts, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+
+dittoBarPlot(fibroblasts, "donor_id", group.by = "subcluster_name", legend.title = "Donor ID", x.reorder = c(4,3,2,1,6,5))+ labs(x = "Cell Type", fill= "Donor ID", y = "Proportion of cells") + theme(text = element_text(size = 15)) + scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+dittoBarPlot(fibroblasts, "subcluster_name", group.by = "donor_id", legend.title = "Cell Type")+ labs(color = "Cell Type", x= "Donor ID", y = "Proportion of cells") + theme(text = element_text(size = 15))  
+
+key_markers = c('PDGFRB', 'PDPN','PECAM1', "THY1", "RGS5", "ACTA2", "MCAM", "MYH11", "CXCL12","CXCL13", "VCAM1", "MADCAM1", "CCL19", "CCL21", "CXCL9", "PTPRG", "CD34", "PI16")
+key_markers1 <- key_markers[key_markers %in% genes]
+dittoDotPlot(fibroblasts, vars = key_markers1, group.by = "subcluster_name", y.reorder = c(4,3,2,1,6,5), ylab = "Cell Type", xlab = "Gene")+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+```
+
+
+
+### Subclustering the Endothelial cells
+
+```{r}
+LECs <- sce[, sce$leiden_clusters_res001 == 9]
+summary(as.factor(LECs$leiden_clusters_res001))
+
+#feature selection
+allfeatures <- modelGeneVar(LECs)
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+
+# Run PCA
+LECs <- runPCA(LECs, subset_row=topn2000_features)
+
+# batch correction
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = LECs@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(LECs), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+LECs@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+#plot UMAP
+set.seed(100) #any random number works, we just set a seed to keep it consistent in the module
+LECs <- runUMAP(LECs, dimred="harmonized_pcs", min_dist = 0.5, n_neighbors = 6)
+plotReducedDim(LECs, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+plotReducedDim(LECs, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+#clustering
+clust.leiden01 <- clusterCells(LECs, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.08)))
+table(clust.leiden01)
+LECs$leiden08 <- clust.leiden01
+dittoDimPlot(LECs, "leiden08", do.label = TRUE)
+```
+
+Plotting known endothelial markers on a dotplot
+```{r}
+key_markers = c('PECAM1', "LYVE1", "NT5E", "CAV1", "MARCO", "CD209", "CLEC4G", "CLEC4M", "PTX3", "FOXC2", "ESAM", "CLDN11", "TNFRSF9", "CCL20", "EFNB2", "ACKR4" )
+key_markers1 <- key_markers[key_markers %in% genes]
+dittoDotPlot(LECs, vars = key_markers1, group.by = "leiden08")
+```
+
+
+```{r}
+plotReducedDim(LECs, dimred="UMAP", colour_by="PECAM1")
+plotReducedDim(LECs, dimred="UMAP", colour_by="CAV1")
+plotReducedDim(LECs, dimred="UMAP", colour_by="ESAM")
+plotReducedDim(LECs, dimred="UMAP", colour_by="NT5E")
+plotReducedDim(LECs, dimred="UMAP", colour_by="CCL20")
+```
+
+
+Naming the clusters
+```{r}
+colData(LECs)$subcluster_name <- ifelse(colData(LECs)$leiden08 == 1, "PECAM1high_CAV1high_ESAMhigh_LEC", ifelse(colData(LECs)$leiden08 == 2, "PECAM1high_NT5E+_LEC", "PECAM1low_CCL20high_LEC"))
+summary(as.factor(LECs$subcluster_name))
+table(LECs$subcluster_name, LECs$leiden08)
+```
+
+
+```{r}
+dittoDimPlot(LECs, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+
+dittoBarPlot(LECs, "donor_id", group.by = "subcluster_name",legend.title = "Donor ID", xlab = "Cell Type", ylab = "Proportion of cells") + theme(text = element_text(size = 15)) + theme(axis.text.x = element_text(angle = 60)) + scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(fill = "Donor ID")
+dittoBarPlot(LECs, "subcluster_name", group.by = "donor_id",legend.title = "Cell Type", xlab = "Donor ID", ylab = "Proportion of cells") + theme(text = element_text(size = 15))
+
+key_markers = c('PECAM1',"CAV1", "EFNB2", "ESAM", "NT5E", "ACKR4", "CLDN11", "CLEC4M", "FOXC2", "PTX3", "LYVE1", "CD44", "TNFRSF9", "CCL20", "MARCO", "CLEC4G")
+key_markers1 <- key_markers[key_markers %in% genes]
+dittoDotPlot(LECs, vars = key_markers1, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene")+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+```
+
+
+
+### Subclustering the Myeloid cells
+
+
+```{r}
+myeloid <- sce[, sce$leiden_clusters_res001 %in% c(3, 6, 7, 8, 10)]
+summary(as.factor(myeloid$leiden_clusters_res001))
+
+#feature selection
+allfeatures <- modelGeneVar(myeloid)
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+
+# Run PCA
+myeloid <- runPCA(myeloid, subset_row=topn2000_features)
+
+# batch correction
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = myeloid@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(myeloid), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+myeloid@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+#plot UMAP
+set.seed(100) #any random number works, we just set a seed to keep it consistent in the module
+myeloid <- runUMAP(myeloid, dimred="harmonized_pcs", min_dist = 0.5, n_neighbors = 6)
+plotReducedDim(myeloid, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+plotReducedDim(myeloid, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+#clustering
+clust.leiden01 <- clusterCells(myeloid, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.045)))
+table(clust.leiden01)
+myeloid$leiden045 <- clust.leiden01
+dittoDimPlot(myeloid, "leiden045", do.label = TRUE)
+```
+
+
+1. looking for mast cells
+```{r}
+key_markers <- c("CMA1", "CPA3", "KIT", "ENPP3", "FCER1A")
+key_markers1 <- key_markers[key_markers %in% genes]
+dittoDotPlot(myeloid, vars = key_markers1, group.by = "leiden045")
+```
+
+2. looking for neutrophils
+```{r}
+key_markers <- c("CCR7", "CD33", "CD19", "CD14", "IL1R2", "MPO", "CEACAM8", "S100A8", "S100A9", "CYP1B1", "CD15", "CR3", "CR32", "CD32", 'CD87', 'CD64', "ENSMMUG00000038920", 'ITGAM', 'PLAUR', 'FCGR1A', 'FCGR2A', 'CEACAM8', 'IL1R2', 'MME', 'FCGR3A', 'MPO', 'PAD15', 'CEACAM9', 'S100A9', 'S100A10', 'MK168', 'CYP1B2', 'CCR8', 'SELL', 'IgM', 'PTPRC', 'ITGB3', 'NCAM1', 'CD33', 'NAMPT')
+key_markers1 <- key_markers[key_markers %in% genes]
+key_markers1 <- unique(key_markers1)
+dittoDotPlot(myeloid, vars = key_markers1, group.by = "leiden045")
+```
+
+3. looking for dendritic cells
+```{r}
+#pDCs
+key_markers <- c("PTPRC", "CCR7", "CD209", "CLEC4C", "LILRB4", "NRP1", "IRF7", "CD14", "MRC1", "CD206", "SIRPA", "ITGAM", "CD1A", "IRF4", "KLF4", "FCER1", "CLEC9A", "CD8A", "ITGAE", "ITGAX", "CD141", "BLTA", "CADM1", "LY75", "THBD", "XCR1", "BATF3", "ID2", "IRF8", "ZBTB46")
+key_markers1 <- key_markers[key_markers %in% genes]
+key_markers1 <- unique(key_markers1)
+dittoDotPlot(myeloid, vars = key_markers1, group.by = "leiden045")
+
+```
+
+4. looking for monocytes
+```{r}
+key_markers <- c("M5E2", "LYZ", "CST3", "CD14", "CD16", "CSF1R", "CX3CR1", "ITGAM", "ITGAX", "LY6C1", "CCR2", "CXCR4", "FCGR1A", "SELL", "SPN", "ADGRE1", "CCR7", "TNF", "CD86", "IL10", "IL1B", "MERTK", "TREML4", "CD209", "NR4A1", "LY6A", "PTPRC", "NR4A1", "CD27", "CD1A", "CCR5", "CD32", "MRC1", "ITGB3", "CXCR6", "CD9", "CCR1", "CLEC12A", "FLT3", "KLF2", "CD68", "CCR6", "CCR8", "KIT", "MAF", "CLEC7A", "MAFB", "SPI1", "CDC1", "PPARG", "CEBPB", "ITGAE", "TEK", "CD14", "FCGR3A", "C1QA", "FCER1A", "CD1C", "LAMP3", "XCR1", "GZMB", "TCF4", "S100A8", "CXCL8", "CCL17", "IL21R", "IL1B", "CLEC10A", "S100A12", "FCGR3", "LPL", "FPL")
+
+key_markers1 <- key_markers[key_markers %in% genes]
+key_markers1 <- unique(key_markers1)
+dittoDotPlot(myeloid, vars = key_markers1, group.by = "leiden045")
+```
+
+```{r}
+plotReducedDim(myeloid, dimred="UMAP", colour_by="CD14")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="FCGR3")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="CD1C")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="LAMP3")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="GZMB")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="TCF4")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="XCR1")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="S100A8")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="CEACAM8")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="FCER1A")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="CMA1")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="CPA3")
+plotReducedDim(myeloid, dimred="UMAP", colour_by="subsets_mito_percent")
+
+```
+
+
+Naming the clusters
+```{r}
+colData(myeloid)$subcluster_name <- ifelse(colData(myeloid)$leiden045 == 1, "discard", ifelse(colData(myeloid)$leiden045 == 2, "pDCs", ifelse(colData(myeloid)$leiden045 == 3, "pDCs", ifelse(colData(myeloid)$leiden045 == 4, "CD1C+_DCs", ifelse(colData(myeloid)$leiden045 == 5, "XCR1+_DCs", ifelse(colData(myeloid)$leiden045 == 6, "Mast_cells", ifelse(colData(myeloid)$leiden045 == 7, "LAMP3+_DCs", ifelse(colData(myeloid)$leiden045 == 8, "Neutrophils", ifelse(colData(myeloid)$leiden045 == 9, "mito_high_myeloid", ifelse(colData(myeloid)$leiden045 == 10, "LAMP3+_DCs", ifelse(colData(myeloid)$leiden045 == 11, "CD14+_monocytes", ifelse(colData(myeloid)$leiden045 == 12, "CD16+_monocytes", ifelse(colData(myeloid)$leiden045 == 13, "discard",  "NA")))))))))))))
+summary(as.factor(myeloid$subcluster_name))
+table(myeloid$subcluster_name, myeloid$leiden045)
+```
+
+```{r}
+plotReducedDim(myeloid, dimred="UMAP", colour_by="subsets_mito_percent")
+```
+
+```{r, fig.width=12}
+
+listgenes <- c("M5E2", "LYZ", "CST3", "CD14", "CD16", "CSF1R", "CX3CR1", "ITGAM", "ITGAX", "LY6C1", "CCR2", "CXCR4", "FCGR1A", "SELL", "SPN", "ADGRE1", "CCR7", "TNF", "CD86", "IL10", "IL1B", "MERTK", "TREML4", "CD209", "NR4A1", "LY6A", "PTPRC", "NR4A1", "CD27", "CD1A", "CCR5", "CD32", "MRC1", "ITGB3", "CXCR6", "CD9", "CCR1", "CLEC12A", "FLT3", "KLF2", "CD68", "CCR6", "CCR8", "KIT", "MAF", "CLEC7A", "MAFB", "SPI1", "CDC1", "PPARG", "CEBPB", "ITGAE", "TEK", "CD14", "FCGR3A", "C1QA", "FCER1A", "CD1C", "LAMP3", "XCR1", "GZMB", "TCF4", "S100A8", "CXCL8", "CCL17", "IL21R", "IL1B", "CLEC10A", "S100A12", "FCGR3", "LPL", "FPL")
+listgenes1 <- listgenes[listgenes %in% genes]
+listgenes1 <- unique(listgenes1)
+
+
+dittoDotPlot(myeloid, vars = listgenes1, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(1,2,3,4,8,9,7,5,6))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+
+```
+
+```{r}
+dittoDimPlot(myeloid, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+
+listgenes <- c("CD14", "LYZ", "FCGR3", "LPL", "CD1C", "CLEC10A", "LAMP3", "CCL17", "CCR7", "GZMB", "TCF4", "XCR1", "CST3", "S100A8", "CEACAM8", "CXCL8", "NAMPT", "FCER1A", "CMA1", "CPA3", "IL21R", "IL1B", "ND3")
+listgenes1 <- listgenes[listgenes %in% genes]
+dittoDotPlot(myeloid, vars = listgenes1, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(1,2,3,4,8,9,7,5,6))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+dittoBarPlot(myeloid, "donor_id", group.by = "subcluster_name", legend.title = "Donor ID", xlab = "Cell Type", ylab = "Proportion of cells", x.reorder = c(1,2,3,4,8,9,7,5,6)) + theme(text = element_text(size = 15)) + scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(fill = "Donor ID")
+dittoBarPlot(myeloid, "subcluster_name", group.by = "donor_id", xlab = "Donor ID", legend.title = "Cell Type", ylab = "Proportion of cells") + theme(text = element_text(size = 15))
+```
+
+
+
+### Subclustering the T cells
+
+```{r}
+Tcells <- sce[, sce$leiden_clusters_res001 == 1]
+summary(as.factor(Tcells$leiden_clusters_res001))
+
+#feature selection
+allfeatures <- modelGeneVar(Tcells)
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+
+# Run PCA
+Tcells <- runPCA(Tcells, subset_row=topn2000_features)
+
+# batch correction
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = Tcells@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(Tcells), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+Tcells@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+#plot UMAP
+set.seed(100) #any random number works, we just set a seed to keep it consistent in the module
+Tcells <- runUMAP(Tcells, dimred="harmonized_pcs", min_dist = 0.5, n_neighbors = 4)
+dittoDimPlot(Tcells, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="donor_id") + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+plotReducedDim(Tcells, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id) + scale_colour_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+#clustering
+clust.leiden01 <- clusterCells(Tcells, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.02)))
+table(clust.leiden01)
+Tcells$leiden02 <- clust.leiden01
+dittoDimPlot(Tcells, "leiden02", do.label = TRUE)
+```
+
+```{r}
+#T-cell
+listgenes <- c('CD4', 'CD8A', 'CD3E', 'CD28', "CCR7", "LEF1", "SELL", "CD27", "IL7R", "FOXP3", "IL2RA", "MKI67", 'CD4', 'CD8A', 'CD3E', 'CD28', "GZMK", "GZMA", "GZMH", "GZMB", "CXCR4", "CCL5", "FGFBP2", "ENSMMUG00000041076", "IL7R", "ANXA1", "RORA", "FOSB", "NFKBIA", "FOXP3", "BCL6", "IL2RA")
+listgenes1 <- listgenes[listgenes %in% genes]
+listgenes1 <- unique(listgenes1)
+dittoDotPlot(Tcells, vars = listgenes1, group.by = "leiden02")
+
+#NK
+listgenes <- c('KLRF1', 'KLRC1', 'KLRD2', 'NKG7', 'KLRB1', 'NCR1', 'NKG2', 'KLRD1', "NCR3", "KLRC2", "KIR3DS1", "KIR2DL5A")
+listgenes1 <- listgenes[listgenes %in% genes]
+dittoDotPlot(Tcells, vars = listgenes1, group.by = "leiden02")
+
+```
+
+```{r}
+#looking for ribosomal genes in T cells
+RPS <- genes[grep("^RPS", unlist(genes))]
+RPL <- genes[grep("^RPL", unlist(genes))]
+list_ribo_genes <- c(RPS,RPL)
+
+
+dittoDotPlot(Tcells, vars = list_ribo_genes, group.by = "leiden02")
+
+plotReducedDim(Tcells, dimred="UMAP", colour_by="subsets_mito_percent")
+```
+
+```{r}
+plotReducedDim(Tcells, dimred="UMAP", colour_by="CD3E")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="CD4")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="CD8A")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="RPL5")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="MKI67")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="S100A6")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="GZMB")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="KLRF1")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="NCAM1")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="FOXP3")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="CTLA4")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="IL2RA")
+plotReducedDim(Tcells, dimred="UMAP", colour_by="subsets_mito_percent")
+
+```
+
+
+Naming the clusters
+```{r}
+colData(Tcells)$subcluster_name <- ifelse(colData(Tcells)$leiden02 == 1, "ribo_high_T_cells", ifelse(colData(Tcells)$leiden02 == 2, "Cycling_T_cells", ifelse(colData(Tcells)$leiden02 == 3, "T_regulatory_cells",  ifelse(colData(Tcells)$leiden02 == 7, "S100A6high_T_cells", ifelse(colData(Tcells)$leiden02 == 6, "NK_cells", "CD8_T_cells")))))
+summary(as.factor(Tcells$subcluster_name))
+table(Tcells$subcluster_name, Tcells$leiden02)
+```
+
+
+```{r}
+dittoDimPlot(Tcells, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+
+listgenes <- c('CD3E', 'CD4', 'CD8A', "FOXP3", "CTLA4", "LEF1", "IL2RA", "ICOS", "BCL6", 'CD28', "CCR7", "SELL", "CXCR4",  "CCL5", "FGFBP2", "GZMK", "GZMA", "GZMH", "GZMB", "NCAM1", 'KLRF1', 'NKG2', 'NCR1', "GNLY", "MKI67", "S100A6", "IL7R", "FOSB", "RPL5")
+listgenes1 <- listgenes[listgenes %in% genes]
+dittoDotPlot(Tcells, vars = listgenes1, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(6,1,3,2,5,4))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+dittoBarPlot(Tcells, "donor_id", group.by = "subcluster_name", legend.title = "Donor ID", xlab = "Cell Type", ylab = "Proportion of cells", x.reorder = c(6,1,3,2,5,4)) + theme(text = element_text(size = 15))+ scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(fill = "Donor ID")
+dittoBarPlot(Tcells, "subcluster_name", group.by = "donor_id", xlab = "Donor ID", legend.title = "Cell Type", ylab = "Proportion of cells") + theme(text = element_text(size = 15))
+
+dittoDotPlot(Tcells, vars = mt_genes, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(6,1,3,2,5,4))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+```
+
+```{r, fig.width=15}
+dittoDotPlot(Tcells, vars = RPS, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(1,2,6,4,5,3))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1") + theme(text = element_text(size = 15))
+
+dittoDotPlot(Tcells, vars = RPL, group.by = "subcluster_name", ylab = "Cell Type", xlab = "Gene", y.reorder = c(1,2,6,4,5,3))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1") + theme(text = element_text(size = 15))
+```
+
+
+
+### Subclustering the B cells + Plasma cells
+
+```{r}
+Bcells <- sce[, sce$leiden_clusters_res001 %in% c(2,4)]
+summary(as.factor(Bcells$leiden_clusters_res001))
+
+#feature selection
+allfeatures <- modelGeneVar(Bcells)
+allfeatures[order(allfeatures$bio, decreasing=TRUE),] 
+topn2000_features <- getTopHVGs(allfeatures, n=2000) #top 2000 genes
+
+# Run PCA
+Bcells <- runPCA(Bcells, subset_row=topn2000_features)
+
+# batch correction
+harmonized_pcs <- HarmonyMatrix(
+  data_mat  = Bcells@int_colData@listData[["reducedDims"]]@listData[["PCA"]],       # Matrix with coordinates for each cell (row) along many PCs (columns)
+  meta_data = colData(Bcells), # Dataframe with information for each cell (row)
+  vars_use  = "donor_id", # Column in meta_data that defines dataset for each cell
+  do_pca    = FALSE      # Since we are providing PCs, do not run PCA
+)
+Bcells@int_colData@listData[["reducedDims"]]@listData[["harmonized_pcs"]] <- harmonized_pcs
+
+#plot UMAP
+set.seed(100) #any random number works, we just set a seed to keep it consistent in the module
+Bcells <- runUMAP(Bcells, dimred="harmonized_pcs", min_dist = 0.5, n_neighbors = 6)
+plotReducedDim(Bcells, dimred="UMAP", colour_by="donor_id")
+plotReducedDim(Bcells, dimred="UMAP", colour_by="donor_id", other_fields = "donor_id") + 
+  facet_wrap(~donor_id)
+
+#clustering
+clust.leiden01 <- clusterCells(Bcells, use.dimred="harmonized_pcs", 
+                              BLUSPARAM=NNGraphParam(cluster.fun="leiden", 
+                                                     cluster.args = list(resolution =0.02)))
+table(clust.leiden01)
+Bcells$leiden02 <- clust.leiden01
+dittoDimPlot(Bcells, "leiden02", do.label = TRUE)
+```
+
+
+
+```{r}
+dittoDimPlot(Bcells, "leiden02", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+
+listgenes <- c("MS4A1", "CD79A", "CD79B", "TCL1A", "IGHM", "ENSMMUG00000015202", "MZB1", "SDC1", "CD38", "VPREB3", "IGKC", "ENSMMUG00000020092", "MKI67",  "COX1", "COX2")
+listgenes1 <- listgenes[listgenes %in% genes]
+dittoDotPlot(Bcells, vars = listgenes1, group.by = "leiden02", ylab = "Cell Type", xlab = "Gene")+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+```
+
+```{r}
+colData(Bcells)$subcluster_name <- ifelse(colData(Bcells)$leiden02 == 1, "discard", ifelse(colData(Bcells)$leiden02 == 2, "B_cells", ifelse(colData(Bcells)$leiden02 == 3, "Plasma_cells", "mito_high_T_and_B_cells")))
+```
+
+
+### Combining finer annotations into a single object
+
+```{r}
+matching_rows <- match(sce$index, fibroblasts$index)
+sce$subcluster_name_fibroblasts <- fibroblasts$subcluster_name[matching_rows]
+sce$subcluster_name <- coalesce(sce$subcluster_name_fibroblasts, sce$subcluster_name)
+
+matching_rows <- match(sce$index, LECs$index)
+sce$subcluster_name_LECs <- LECs$subcluster_name[matching_rows]
+sce$subcluster_name <- coalesce(sce$subcluster_name_LECs, sce$subcluster_name)
+
+matching_rows <- match(sce$index, myeloid$index)
+sce$subcluster_name_myeloid <- myeloid$subcluster_name[matching_rows]
+sce$subcluster_name <- coalesce(sce$subcluster_name_myeloid, sce$subcluster_name)
+
+matching_rows <- match(sce$index, Tcells$index)
+sce$subcluster_name_Tcells <- Tcells$subcluster_name[matching_rows]
+sce$subcluster_name <- coalesce(sce$subcluster_name_Tcells, sce$subcluster_name)
+
+matching_rows <- match(sce$index, Bcells$index)
+sce$subcluster_name_Bcells <- Bcells$subcluster_name[matching_rows]
+sce$subcluster_name <- coalesce(sce$subcluster_name_Bcells, sce$subcluster_name)
+```
+
+```{r}
+#discarding cells from soupy subclusters
+sce <- sce[, !sce$subcluster_name %in% c("discard")]
+```
+
+```{r}
+# annotating broad clusters
+whole$cluster_name <- ifelse(whole$subcluster_name %in% c("B_cells", "CD8_T_cells", "CD8_T_cells_NK_high", "cycling_T_cells", "mito_high_T_and_B_cells", "ribosomal_high_CD4_Tcells", "stressed_T_cells", "T_follicular_regulatory_cells"), "Lymphoid_cells", ifelse(whole$subcluster_name %in% c("CCL19high_fibroblast", "CD34+_fibroblasts", "CXCL12high_fibroblasts", "mito_high_fibroblasts"), "Fibroblasts", ifelse(whole$subcluster_name %in% c("Myofibroblasts", "Pericytes"), "Pericytes", ifelse(whole$subcluster_name %in% c("Valve_LEC", "Floor_LEC", "Ceiling_LEC"), "Endothelial_cells", "Myeloid_cells"))))
+
+# annotating broad clusters + lymphoid subclusters
+sce$clustername1 <- ifelse(sce$cluster_name == "Fibroblasts", "Fibroblasts/Pericytes", ifelse(sce$cluster_name == "Myeloid_cells", "Myeloid_cells",  ifelse(sce$cluster_name == "Endothelial_cells", "Endothelial_cells", ifelse(sce$cluster_name == "Pericytes", "Fibroblasts/Pericytes", ifelse(sce$subcluster_name == "B_cells", "B_cells", ifelse(sce$subcluster_name == "mito_high_T_and_B_cells", "mito_high_T_and_B_cells",ifelse(sce$subcluster_name == "Plasma_cells", "Plasma_cells", "T_cells")))))))
+```
+
+
+```{r}
+listgenes <- c("CD3E","MS4A1","IGHM", "MZB1", "SDC1", "ND2", "LYZ", "LAMP3", "XCR1", "CPA3", "PDPN", "PDGFRB", "CXCL12", "RGS5", "THY1", "PECAM1")
+listgenes1 <- listgenes[listgenes %in% genes]
+dittoDotPlot(sce, vars = listgenes1, group.by = "clustername1", ylab = "Cell Type", xlab = "Gene", y.reorder = c(7,1,6,4,5,3,2))+
+  scale_colour_gradient2(low="steelblue", mid="lightgrey", high="darkgoldenrod1", name = "relative expression") + theme(text = element_text(size = 15))
+
+```
+
+
+```{r}
+dittoDimPlot(sce, "clustername1", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+dittoDimPlot(sce, "subcluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+dittoDimPlot(sce, "cluster_name", do.label = TRUE, labels.size = 4, legend.size = 6, legend.title = "Cell Type")
+```
+
+
+```{r}
+plotReducedDim(sce, dimred="UMAP", colour_by="CD3E")
+plotReducedDim(sce, dimred="UMAP", colour_by="MS4A1")
+plotReducedDim(sce, dimred="UMAP", colour_by="IGHM")
+plotReducedDim(sce, dimred="UMAP", colour_by="subsets_mito_percent")
+plotReducedDim(sce, dimred="UMAP", colour_by="LYZ")
+plotReducedDim(sce, dimred="UMAP", colour_by="PECAM1")
+plotReducedDim(sce, dimred="UMAP", colour_by="PDPN")
+
+```
+
+
+```{r}
+dittoBarPlot(sce, "donor_id", group.by = "subcluster_name", legend.title = "Donor ID", xlab = "Cell Type", ylab = "Proportion of cells") + theme(text = element_text(size = 15)) + theme(axis.text.x = element_text(angle = 60)) + scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(fill = "Donor ID")
+dittoBarPlot(sce, "subcluster_name", group.by = "donor_id",legend.title = "Cell Type", xlab = "Donor ID", ylab = "Proportion of cells") + theme(text = element_text(size = 15))
+```
+
+```{r}
+dittoBarPlot(sce, "donor_id", group.by = "clustername1", legend.title = "Donor ID", xlab = "Cell Type", ylab = "Proportion of cells") + theme(text = element_text(size = 15)) + theme(axis.text.x = element_text(angle = 60)) + scale_fill_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A")) + labs(fill = "Donor ID")
+dittoBarPlot(sce, "clustername1", group.by = "donor_id",legend.title = "Cell Type", xlab = "Donor ID", ylab = "Proportion of cells") + theme(text = element_text(size = 15))
+```
+
+
+
+### Calculating Abundances
+
+```{r, fig.width=15}
+# excluding lymphoid cells
+sce_test <- sce[, sce$clustername1 %in% c("Endothelial_cells", "Fibroblasts/Pericytes", "Myeloid_cells")]
+
+to_pct <- function(x) {
+  total <- sum(x)
+  x/total*100
+}
+
+boxplot_table <- table(sce_test$donor_id, sce_test$subcluster_name)
+boxplot_table <- apply(boxplot_table, 1, to_pct)
+boxplot_table <- data.frame(boxplot_table)
+boxplot_table$cluster_id <- rownames(boxplot_table)
+boxplot_table_long <- pivot_longer(boxplot_table, cols = c("PrLN1", "PrLN2", "PrLN4", "PrLN5", "PrLN6"))
+colnames(boxplot_table_long)[2] <- "donor_id" 
+
+ggplot(boxplot_table_long, aes(y = value, x = factor(cluster_id, level=c('Pericytes', 'Myofibroblasts', 'CCL19high_Fibroblasts', 'CXCL12high_Fibroblasts', 'PI16+_Fibroblasts', 'PTPRGhigh_Fibroblasts', "PECAM1high_CAV1high_ESAMhigh_LEC", "PECAM1high_NT5E+_LEC", "PECAM1low_CCL20high_LEC", 'CD14+_monocytes', 'CD16+_monocytes', 'CD1C+_DCs', 'LAMP3+_DCs', 'pDCs', 'XCR1+_DCs', 'Neutrophils', 'Mast_cells', 'mito_high_myeloid')))) + 
+  geom_boxplot(fill = "lightgray") + 
+  geom_point(aes(colour = donor_id, size = 1)) +  
+  labs(x = "Cell Type", y = "Proportion of cells (average across donors)", color = "Donor ID") + 
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle = 55, hjust = 1),panel.background = element_rect(fill = "white", colour ="darkgray", size = 2), panel.grid.major = element_line(colour = "gray", size = 0.3)) + 
+  scale_color_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+
+```
+
+
+
+```{r, fig.width=15}
+#for myeloid subclusters
+
+sce_test <- sce[, sce$clustername1 %in% c("Myeloid_cells")]
+
+to_pct <- function(x) {
+  total <- sum(x)
+  x/total*100
+}
+
+boxplot_table <- table(sce_test$donor_id, sce_test$subcluster_name)
+boxplot_table <- apply(boxplot_table, 1, to_pct)
+boxplot_table <- data.frame(boxplot_table)
+boxplot_table$cluster_id <- rownames(boxplot_table)
+boxplot_table_long <- pivot_longer(boxplot_table, cols = c("PrLN1", "PrLN2", "PrLN4", "PrLN5", "PrLN6"))
+colnames(boxplot_table_long)[2] <- "donor_id" 
+
+ggplot(boxplot_table_long, aes(y = value, x = factor(cluster_id, level=c('Pericytes', 'Myofibroblasts', 'CCL19high_Fibroblasts', 'CXCL12high_Fibroblasts', 'PI16+_Fibroblasts', 'PTPRGhigh_Fibroblasts', "PECAM1high_CAV1high_ESAMhigh_LEC", "PECAM1high_NT5E+_LEC", "PECAM1low_CCL20high_LEC", 'CD14+_monocytes', 'CD16+_monocytes', 'CD1C+_DCs', 'LAMP3+_DCs', 'pDCs', 'XCR1+_DCs', 'Neutrophils', 'Mast_cells', 'mito_high_myeloid')))) + 
+  geom_boxplot(fill = "lightgray") + 
+  geom_point(aes(colour = donor_id, size = 1)) +  
+  labs(x = "Cell Type", y = "Proportion of myeloid cells (average across donors)", color = "Donor ID") + 
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle = 55, hjust = 1),panel.background = element_rect(fill = "white", colour ="darkgray", size = 2), panel.grid.major = element_line(colour = "gray", size = 0.3)) + 
+  scale_color_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+```
+
+```{r, fig.width=15}
+# for LEC subclusters
+sce_test <- sce[, sce$clustername1 == c("Endothelial_cells")]
+
+to_pct <- function(x) {
+  total <- sum(x)
+  x/total*100
+}
+
+boxplot_table <- table(sce_test$donor_id, sce_test$subcluster_name)
+boxplot_table <- apply(boxplot_table, 1, to_pct)
+boxplot_table <- data.frame(boxplot_table)
+boxplot_table$cluster_id <- rownames(boxplot_table)
+boxplot_table_long <- pivot_longer(boxplot_table, cols = c("PrLN1", "PrLN2", "PrLN4", "PrLN5", "PrLN6"))
+colnames(boxplot_table_long)[2] <- "donor_id" 
+
+ggplot(boxplot_table_long, aes(y = value, x = factor(cluster_id, level=c('Pericytes', 'Myofibroblasts', 'CCL19high_Fibroblasts', 'CXCL12high_Fibroblasts', 'PI16+_Fibroblasts', 'PTPRGhigh_Fibroblasts', "PECAM1high_CAV1high_ESAMhigh_LEC", "PECAM1high_NT5E+_LEC", "PECAM1low_CCL20high_LEC", 'CD14+_monocytes', 'CD16+_monocytes', 'CD1C+_DCs', 'LAMP3+_DCs', 'pDCs', 'XCR1+_DCs', 'Neutrophils', 'Mast_cells', 'mito_high_myeloid')))) + 
+  geom_boxplot(fill = "lightgray") + 
+  geom_point(aes(colour = donor_id, size = 1)) +  
+  labs(x = "Cell Type", y = "Proportion of LECs (average across donors)", color = "Donor ID") + 
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle =70, hjust = 1),panel.background = element_rect(fill = "white", colour ="darkgray", size = 2), panel.grid.major = element_line(colour = "gray", size = 0.3)) + 
+  scale_color_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+```
+
+
+```{r, fig.width=15}
+#for fibroblast subclusters
+sce_test <- sce[, sce$clustername1 %in% c("Fibroblasts/Pericytes")]
+
+to_pct <- function(x) {
+  total <- sum(x)
+  x/total*100
+}
+
+boxplot_table <- table(sce_test$donor_id, sce_test$subcluster_name)
+boxplot_table <- apply(boxplot_table, 1, to_pct)
+boxplot_table <- data.frame(boxplot_table)
+boxplot_table$cluster_id <- rownames(boxplot_table)
+boxplot_table_long <- pivot_longer(boxplot_table, cols = c("PrLN1", "PrLN2", "PrLN4", "PrLN5", "PrLN6"))
+colnames(boxplot_table_long)[2] <- "donor_id" 
+
+ggplot(boxplot_table_long, aes(y = value, x = factor(cluster_id, level=c('Pericytes', 'Myofibroblasts', 'CCL19high_Fibroblasts', 'CXCL12high_Fibroblasts', 'PI16+_Fibroblasts', 'PTPRGhigh_Fibroblasts', "PECAM1high_CAV1high_ESAMhigh_LEC", "PECAM1high_NT5E+_LEC", "PECAM1low_CCL20high_LEC", 'CD14+_monocytes', 'CD16+_monocytes', 'CD1C+_DCs', 'LAMP3+_DCs', 'pDCs', 'XCR1+_DCs', 'Neutrophils', 'Mast_cells', 'mito_high_myeloid')))) + 
+  geom_boxplot(fill = "lightgray") + 
+  geom_point(aes(colour = donor_id, size = 1)) +  
+  labs(x = "Cell Type", y = "Proportion of Fibroblasts (average across donors)", color = "Donor ID") + 
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle = 55, hjust = 1),panel.background = element_rect(fill = "white", colour ="darkgray", size = 2), panel.grid.major = element_line(colour = "gray", size = 0.3)) + 
+  scale_color_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+```
+
+```{r, fig.width=15}
+# T cell subclusters
+sce_test <- sce[, sce$clustername1 == "T_cells"]
+
+to_pct <- function(x) {
+  total <- sum(x)
+  x/total*100
+}
+
+boxplot_table <- table(sce_test$donor_id, sce_test$subcluster_name)
+boxplot_table <- apply(boxplot_table, 1, to_pct)
+boxplot_table <- data.frame(boxplot_table)
+boxplot_table$cluster_id <- rownames(boxplot_table)
+boxplot_table_long <- pivot_longer(boxplot_table, cols = c("PrLN1", "PrLN2", "PrLN4", "PrLN5", "PrLN6"))
+colnames(boxplot_table_long)[2] <- "donor_id" 
+
+ggplot(boxplot_table_long, aes(y = value, x = cluster_id)) + 
+  geom_boxplot(fill = "lightgray") + 
+  geom_point(aes(colour = donor_id, size = 1)) +  
+  labs(x = "Cell Type", y = "Proportion of T cells (average across donors)", color = "Donor ID") + 
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle = 55, hjust = 1),panel.background = element_rect(fill = "white", colour ="darkgray", size = 2), panel.grid.major = element_line(colour = "gray", size = 0.3)) + 
+  scale_color_manual(values=c("#E6A0C4" , "#FAD510" ,"#5BBCD6", "#F98400", "#00A08A"))
+
+```
+
+### Making a heatmap of the most differentially expressed genes
+```{r}
+celltype_mean <- aggregateAcrossCells(as(sce, "SingleCellExperiment"),  
+                     ids = sce$subcluster_name, 
+                     statistics = "mean",
+                     use.assay.type = "logcounts")
+
+# No scaling
+dittoHeatmap(celltype_mean,
+             assay = "logcounts", 
+             cluster_cols = TRUE, genes = unique(c('PDPN', "THY1", "RGS5", "ACTA2", "MCAM", "MYH11", "CXCL12", "VCAM1", "MADCAM1", "CCL19", "CCL21", "CXCL9", "PTPRG", "CD34", "PI16", 'PECAM1',"CAV1", "EFNB2", "ESAM", "NT5E", "ACKR4", "CLDN11", "CLEC4M", "FOXC2", "PTX3", "LYVE1", "CD44", "TNFRSF9", "CCL20", "MARCO", "CLEC4G", "CD14", "LYZ", "FCGR3", "LPL", "CD1C", "CLEC10A", "LAMP3", "CCL17", "CCR7", "GZMB", "TCF4", "XCR1", "CST3", "S100A8", "CEACAM8", "CXCL8", "NAMPT", "FCER1A", "CMA1", "CPA3", "IL21R", "IL1B", "ND3", 'CD3E', 'CD4', 'CD8A', "FOXP3", "LEF1", "IL2RA", "ICOS", "BCL6", 'CD28', "CCR7", "SELL", "CXCR4",  "CCL5", "FGFBP2", "GZMK", "GZMA", "GZMH", "GZMB", "NCAM1", 'KLRF1', 'NKG2', 'NCR1', "GNLY", "MKI67", "S100A6", "IL7R", "FOSB","MS4A1","IGHM", "MZB1", "SDC1")),
+             scale = "none",
+             annot.by =  c("cluster_name","subcluster_name"), 
+             order.by = c("cluster_name","subcluster_name"), scaled.to.max = TRUE)
+```
+
